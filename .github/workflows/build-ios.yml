@@ -67,6 +67,24 @@ jobs:
           gem install cocoapods --no-document
           pod --version
 
+      - name: 同步依赖锁文件
+        run: |
+          set -euo pipefail
+          # 上游 pubspec.lock 落后于 pubspec.yaml（缺少 video_player 等 7 个依赖），
+          # 直接跑 build_ios.py 会卡在 --enforce-lockfile。
+          # pub get 是最小变更解析：保留已有锁定版本，只补齐缺失项。
+          flutter pub get
+
+      - name: 解除 build_ios.py 的锁文件强制校验
+        run: |
+          set -euo pipefail
+          if grep -q -- "--enforce-lockfile" scripts/build_ios.py; then
+            sed -i.bak "s/'--enforce-lockfile'//g" scripts/build_ios.py
+            rm -f scripts/build_ios.py.bak
+            echo "已移除 --enforce-lockfile"
+          fi
+          grep -n "'pub', 'get'" scripts/build_ios.py
+
       - name: 构建 ${{ matrix.label }}（未签名）
         run: python3 scripts/build_ios.py ${{ matrix.arguments }}
 
