@@ -1,0 +1,173 @@
+name: Build iOS unsigned IPA
+
+# 用途：在 GitHub 的 macOS 机器上编译 guoapp（红果鉴 / 真果鉴）的 iOS 未签名包，
+# 产物可直接用 TrollStore 安装（TrollStore 会在安装时自行完成签名）。
+#
+# 放置位置：<你的 fork>/.github/workflows/build-ios.yml
+# 触发方式：Actions 页面点 "Run workflow"，或推送本文件到 main 分支时自动触发。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/build-ios.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPROXY: https://goproxy.cn,direct
+  GOSUMDB: off
+  COCOAPODS_DISABLE_STATS: 'true'
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: hongguojian
+            label: 红果鉴
+            arguments: ''
+          - edition: zhenguojian
+            label: 真果鉴
+            arguments: '--all-sources'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+
+      - name: 环境自检
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          python3 --version
+          go version
+          flutter --version
+          gem install cocoapods --no-document
+          pod --version
+
+      - name: 构建 ${{ matrix.label }}（未签名）
+        run: python3 scripts/build_ios.py ${{ matrix.arguments }}
+
+      - name: 重新打包 IPA（修正 Payload 目录结构）
+        run: |
+          set -euo pipefail
+          app="build/ios/iphoneos/Runner.app"
+          test -d "$app"
+          version=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n1)
+          outdir="dist/ios"
+          mkdir -p "$outdir"
+          ipa="$GITHUB_WORKSPACE/$outdir/${{ matrix.edition }}-${version}-ios-unsigned.ipa"
+          rm -f "$ipa" "$outdir/SHA256SUMS.txt"
+          rm -rf /tmp/ipa-payload
+          mkdir -p /tmp/ipa-payload/Payload
+          cp -R "$app" /tmp/ipa-payload/Payload/
+          ( cd /tmp/ipa-payload && zip -qry "$ipa" Payload )
+          echo "== IPA 顶层结构（必须看到 Payload/）"
+          unzip -l "$ipa" | head -n 8
+
+      - name: 生成 TrollStore 伪签名 IPA
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          app="build/ios/iphoneos/Runner.app"
+          brew install ldid >/dev/null 2>&1 || true
+          command -v ldid >/dev/null 2>&1 || exit 0
+          while IFS= read -r -d '' binary; do
+            if file "$binary" | grep -q 'Mach-O'; then
+              ldid -S "$binary" 2>/dev/null || true
+            fi
+          done < <(find "$app" -type f -print0)
+          version=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n1)
+          outdir="dist/ios"
+          out="$GITHUB_WORKSPACE/$outdir/${{ matrix.edition }}-${version}-ios-trollstore.ipa"
+          rm -f "$out"
+          rm -rf /tmp/ts-payload
+          mkdir -p /tmp/ts-payload/Payload
+          cp -R "$app" /tmp/ts-payload/Payload/
+          ( cd /tmp/ts-payload && zip -qry "$out" Payload )
+          ls -lh "$out"
+
+      - name: 列出产物
+        run: ls -lh dist/ios/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.edition }}-ios
+          path: dist/ios/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: [ios]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 汇总产物
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f \( -name '*.ipa' -o -name '*.zip' \) -exec cp -v {} release/ \;
+          ls -lh release
+
+      - name: 发布 Release
+        # fork 仓库若未开启 "Read and write permissions"，这里会 403。
+        # 产物已经在 Actions Artifacts 里了，所以不让它把整个任务标红。
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(release/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "没有可发布的产物，跳过发布。"
+            exit 0
+          fi
+          ( cd release && sha256sum "${files[@]##*/}" > SHA256SUMS.txt && cat SHA256SUMS.txt )
+          version=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n1)
+          tag="ios-v${version//+/-}"
+          {
+            printf '%s\n\n' "iOS 未签名安装包，版本 ${version}，面向 TrollStore / 自签工具。"
+            printf '%s\n' "- *-ios-unsigned.ipa：未签名 IPA，TrollStore 可直接安装（安装时由 TrollStore 完成签名）"
+            printf '%s\n' "- *-ios-trollstore.ipa：已用 ldid 伪签名；上面那个装不上就换这个"
+            printf '%s\n' "- *-ios-unsigned-app.zip：未签名 Runner.app，供 Sideloadly / AltStore 自签"
+            printf '\n%s\n' "系统要求：iOS 15.1 及以上（工程 IPHONEOS_DEPLOYMENT_TARGET = 15.1）。"
+            printf '\n%s\n' "校验：SHA256SUMS.txt"
+          } > notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release/* --clobber
+            gh release edit "$tag" --title "iOS 未签名包 ${version}" --notes-file notes.md
+          else
+            gh release create "$tag" release/* --title "iOS 未签名包 ${version}" --notes-file notes.md
+          fi
